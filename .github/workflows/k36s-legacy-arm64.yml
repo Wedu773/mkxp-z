@@ -1,4 +1,4 @@
-name: Build K36S Legacy ARM64 v4
+name: Build K36S Legacy ARM64 v5
 
 on:
   workflow_dispatch:
@@ -37,13 +37,14 @@ jobs:
           export MAKEFLAGS="-j2"
 
           mkdir -p /work/build-logs
-          git config --global --add safe.directory /work
 
+          # No se usa ningún programa opcional antes de instalarlo. La imagen
+          # base es mínima y ni siquiera incluye git.
           echo 'Acquire::Retries "5";' > /etc/apt/apt.conf.d/80-retries
           apt-get update
           apt-get install -y --no-install-recommends \
             ca-certificates curl wget git file patch rsync \
-            build-essential gcc g++ binutils \
+            build-essential gcc g++ binutils cmake \
             autoconf automake libtool pkg-config \
             python3 python3-pip python3-setuptools \
             ruby bison xxd perl gettext gperf texinfo \
@@ -54,6 +55,16 @@ jobs:
             libdrm-dev libgbm-dev libudev-dev \
             libx11-dev libxext-dev libxrandr-dev libxcursor-dev \
             libxi-dev libxinerama-dev libxss-dev libxxf86vm-dev
+
+          # Comprobación temprana para que cualquier carencia de la imagen
+          # base se detecte aquí y no media hora después.
+          for tool in git curl wget make gcc g++ cmake python3 ruby bison xxd pkg-config file readelf patchelf; do
+            command -v "$tool" >/dev/null 2>&1 || { echo "Falta la herramienta: $tool" >&2; exit 1; }
+          done
+          git config --global --add safe.directory /work
+          test -f /work/meson.build
+          test -f /work/linux/Makefile
+          test -f /work/linux/vars.sh
 
           # GCC 8 es preferible para dependencias modernas. Si no está en el
           # repositorio ARM64 de Bionic, se conserva el GCC 7 del sistema.
@@ -77,7 +88,12 @@ jobs:
             --output "${CMAKE_ARCHIVE}" "${CMAKE_BASE_URL}/${CMAKE_ARCHIVE}"
           curl --fail --location --retry 5 --retry-delay 3 \
             --output "cmake-SHA-256.txt" "${CMAKE_BASE_URL}/cmake-${CMAKE_VERSION}-SHA-256.txt"
-          grep "  ${CMAKE_ARCHIVE}$" cmake-SHA-256.txt | sha256sum --check --strict
+          CMAKE_SHA256="$(awk -v file="${CMAKE_ARCHIVE}" '$2 == file || $2 == "*" file {print $1; exit}' cmake-SHA-256.txt)"
+          if [ -z "${CMAKE_SHA256}" ]; then
+            echo "No se encontró el checksum de ${CMAKE_ARCHIVE}." >&2
+            exit 1
+          fi
+          printf '%s  %s\n' "${CMAKE_SHA256}" "${CMAKE_ARCHIVE}" | sha256sum --check --strict
           rm -rf /opt/cmake
           mkdir -p /opt/cmake
           tar -xzf "${CMAKE_ARCHIVE}" --strip-components=1 -C /opt/cmake
@@ -111,11 +127,24 @@ jobs:
 
           makefile = Path('/work/linux/Makefile')
           text = makefile.read_text()
-          text = text.replace(
-              '$(DOWNLOADS)/sdl2/CMakeLists.txt $(LIBDIR)/libdbus-1.so.3.38.3',
-              '$(DOWNLOADS)/sdl2/CMakeLists.txt'
-          )
-          text = text.replace('-DSDL_DBUS=yes', '-DSDL_DBUS=no')
+
+          replacements = [
+              (
+                  '$(DOWNLOADS)/sdl2/CMakeLists.txt $(LIBDIR)/libdbus-1.so.3.38.3',
+                  '$(DOWNLOADS)/sdl2/CMakeLists.txt'
+              ),
+              ('-DSDL_DBUS=yes', '-DSDL_DBUS=no'),
+              # JPEG y PNG cubren los recursos de RPG Maker/Pokémon Essentials.
+              # JXL arrastra Highway y exige toolchains más recientes sin aportar
+              # nada a estos juegos, así que se desactiva en el build legado.
+              ('-DSDL2IMAGE_JXL=yes', '-DSDL2IMAGE_JXL=no'),
+          ]
+
+          for old, new in replacements:
+              if old not in text:
+                  raise SystemExit('No se encontró el fragmento esperado en linux/Makefile: ' + old)
+              text = text.replace(old, new, 1)
+
           makefile.write_text(text)
 
           install_script = Path('/work/linux/install.sh')
@@ -146,6 +175,13 @@ jobs:
           install_script.chmod(0o755)
           PY
 
+          grep -F -- '-DSDL_DBUS=no' /work/linux/Makefile >/dev/null
+          grep -F -- '-DSDL2IMAGE_JXL=no' /work/linux/Makefile >/dev/null
+          if grep -F -- 'libdbus-1.so.3.38.3' /work/linux/Makefile | grep -F 'sdl2/CMakeLists.txt' >/dev/null; then
+            echo 'La dependencia obligatoria de D-Bus sigue presente en la regla de SDL2.' >&2
+            exit 1
+          fi
+
           # Construcción limpia y reproducible. Evita reutilizar restos de una
           # ejecución fallida anterior.
           rm -rf /work/build \
@@ -156,14 +192,21 @@ jobs:
           make NPROC=2
 
           cd /work
+          # vars.sh está escrito para shells sin `set -u` y consulta variables
+          # opcionales como ARCH y LD_LIBRARY_PATH. Se desactiva nounset solo
+          # durante su carga y se vuelve a activar inmediatamente después.
+          set +u
           source linux/vars.sh
+          set -u
 
           meson setup build \
             --bindir=. \
             --prefix=/work/build/local \
             -Dgfx_backend=gles \
             -Dworkdir_current=true \
-            -Dstatic_executable=true
+            -Dstatic_executable=true \
+            -Dappimage=false \
+            -Dcjk_fallback_font=false
 
           ninja -C build -j2
           ninja -C build install
@@ -346,7 +389,7 @@ jobs:
       - name: Upload K36S runtime
         uses: actions/upload-artifact@v4
         with:
-          name: mkxp-z.k36s.glibc227.arm64.v4
+          name: mkxp-z.k36s.glibc227.arm64.v5
           path: build/local
           if-no-files-found: error
           compression-level: 9
@@ -355,10 +398,11 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: mkxp-z.k36s.build-diagnostics.v4
+          name: mkxp-z.k36s.build-diagnostics.v5
           path: |
             build-logs
             build/meson-logs
+            .github/workflows/k36s-legacy-arm64.yml
             linux/downloads/**/CMakeFiles/CMakeError.log
             linux/downloads/**/CMakeFiles/CMakeOutput.log
             linux/downloads/**/config.log
