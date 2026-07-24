@@ -1,84 +1,366 @@
-name: Build K36S Legacy ARM64
+name: Build K36S Legacy ARM64 v4
 
 on:
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
   build-k36s:
-    name: Ubuntu 18.04 ARM64 (glibc 2.27)
+    name: Ubuntu 18.04 ARM64 + GLES (K36S)
     runs-on: ubuntu-22.04
     timeout-minutes: 360
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
-          submodules: recursive
+          submodules: false
+          fetch-depth: 1
 
       - name: Enable ARM64 emulation
         uses: docker/setup-qemu-action@v3
         with:
           platforms: arm64
 
-      - name: Build inside Ubuntu 18.04 ARM64
+      - name: Create the ARM64 container build script
+        shell: bash
         run: |
+          cat > "$RUNNER_TEMP/build-k36s-container.sh" <<'CONTAINER_SCRIPT'
+          #!/usr/bin/env bash
+          set -Eeuo pipefail
+
+          trap 'rc=$?; echo; echo "[ERROR] Línea ${LINENO}: ${BASH_COMMAND}"; echo "[ERROR] Código de salida: ${rc}"; exit "${rc}"' ERR
+
+          export DEBIAN_FRONTEND=noninteractive
+          export MAKEFLAGS="-j2"
+
+          mkdir -p /work/build-logs
+          git config --global --add safe.directory /work
+
+          echo 'Acquire::Retries "5";' > /etc/apt/apt.conf.d/80-retries
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            ca-certificates curl wget git file patch rsync \
+            build-essential gcc g++ binutils \
+            autoconf automake libtool pkg-config \
+            python3 python3-pip python3-setuptools \
+            ruby bison xxd perl gettext gperf texinfo \
+            patchelf \
+            zlib1g-dev libbz2-dev libexpat1-dev \
+            libasound2-dev libpulse-dev \
+            libgl1-mesa-dev libegl1-mesa-dev libgles2-mesa-dev \
+            libdrm-dev libgbm-dev libudev-dev \
+            libx11-dev libxext-dev libxrandr-dev libxcursor-dev \
+            libxi-dev libxinerama-dev libxss-dev libxxf86vm-dev
+
+          # GCC 8 es preferible para dependencias modernas. Si no está en el
+          # repositorio ARM64 de Bionic, se conserva el GCC 7 del sistema.
+          if apt-cache show gcc-8 >/dev/null 2>&1 && apt-cache show g++-8 >/dev/null 2>&1; then
+            apt-get install -y --no-install-recommends gcc-8 g++-8
+            export CC=gcc-8
+            export CXX=g++-8
+          else
+            export CC=gcc
+            export CXX=g++
+          fi
+
+          # El CMake 3.10 de Ubuntu 18.04 es demasiado antiguo para algunas
+          # dependencias actuales de mkxp-z. Se usa un CMake oficial ARM64,
+          # manteniendo glibc 2.27 como base de enlace.
+          CMAKE_VERSION="3.28.6"
+          CMAKE_ARCHIVE="cmake-${CMAKE_VERSION}-linux-aarch64.tar.gz"
+          CMAKE_BASE_URL="https://github.com/Kitware/CMake/releases/download/v${CMAKE_VERSION}"
+          cd /tmp
+          curl --fail --location --retry 5 --retry-delay 3 \
+            --output "${CMAKE_ARCHIVE}" "${CMAKE_BASE_URL}/${CMAKE_ARCHIVE}"
+          curl --fail --location --retry 5 --retry-delay 3 \
+            --output "cmake-SHA-256.txt" "${CMAKE_BASE_URL}/cmake-${CMAKE_VERSION}-SHA-256.txt"
+          grep "  ${CMAKE_ARCHIVE}$" cmake-SHA-256.txt | sha256sum --check --strict
+          rm -rf /opt/cmake
+          mkdir -p /opt/cmake
+          tar -xzf "${CMAKE_ARCHIVE}" --strip-components=1 -C /opt/cmake
+          export PATH="/opt/cmake/bin:${PATH}"
+
+          # Python 3.6 solo admite Meson hasta 0.61.5.
+          python3 -m pip install --no-cache-dir \
+            pip==21.3.1 setuptools==59.6.0 wheel==0.37.1
+          python3 -m pip install --no-cache-dir \
+            meson==0.61.5 ninja==1.10.2.4
+
+          echo "===== TOOLCHAIN ====="
+          uname -a
+          ldd --version | head -n 1
+          "${CC}" --version | head -n 1
+          "${CXX}" --version | head -n 1
+          cmake --version | head -n 1
+          meson --version
+          ninja --version
+          echo "====================="
+
+          cd /work
+
+          # Adaptaciones conservadoras para una consola sin escritorio:
+          # 1) D-Bus no es necesario para ejecutar el juego y era una fuente
+          #    de incompatibilidades con herramientas antiguas.
+          # 2) El script de instalación original falla si una biblioteca
+          #    opcional no aparece en ldd; se sustituye por uno tolerante.
+          python3 - <<'PY'
+          from pathlib import Path
+
+          makefile = Path('/work/linux/Makefile')
+          text = makefile.read_text()
+          text = text.replace(
+              '$(DOWNLOADS)/sdl2/CMakeLists.txt $(LIBDIR)/libdbus-1.so.3.38.3',
+              '$(DOWNLOADS)/sdl2/CMakeLists.txt'
+          )
+          text = text.replace('-DSDL_DBUS=yes', '-DSDL_DBUS=no')
+          makefile.write_text(text)
+
+          install_script = Path('/work/linux/install.sh')
+          install_script.write_text(r'''#!/usr/bin/env bash
+          set -u
+          BINARY="$1"
+          ARCH="$2"
+          DEST="${MESON_INSTALL_PREFIX}/lib${ARCH}"
+          mkdir -p "$DEST"
+
+          copy_optional_dep() {
+            local pattern="$1"
+            local dep
+            dep="$(ldd "$BINARY" 2>/dev/null | awk -v p="$pattern" '$1 ~ p && $3 ~ /^\// {print $3; exit}')"
+            if [ -n "$dep" ] && [ -f "$dep" ]; then
+              echo "Copying optional dependency: $dep"
+              cp -L "$dep" "$DEST/"
+            else
+              echo "Optional dependency not linked: $pattern"
+            fi
+          }
+
+          copy_optional_dep 'libruby'
+          copy_optional_dep 'libcrypt'
+          copy_optional_dep 'libbsd'
+          exit 0
+          ''')
+          install_script.chmod(0o755)
+          PY
+
+          # Construcción limpia y reproducible. Evita reutilizar restos de una
+          # ejecución fallida anterior.
+          rm -rf /work/build \
+                 /work/linux/build-aarch64 \
+                 /work/linux/downloads/aarch64
+
+          cd /work/linux
+          make NPROC=2
+
+          cd /work
+          source linux/vars.sh
+
+          meson setup build \
+            --bindir=. \
+            --prefix=/work/build/local \
+            -Dgfx_backend=gles \
+            -Dworkdir_current=true \
+            -Dstatic_executable=true
+
+          ninja -C build -j2
+          ninja -C build install
+
+          cd /work/build/local
+          BIN="$(find . -maxdepth 1 -type f -name 'mkxp-z.*' -print -quit)"
+          if [ -z "$BIN" ]; then
+            echo "No se ha generado el ejecutable mkxp-z." >&2
+            exit 1
+          fi
+
+          rm -rf stdlib scripts
+          cp -a /work/linux/build-aarch64/lib/ruby/3.1.0 ./stdlib
+          cp -a /work/mkxp.json .
+          cp -a /work/scripts .
+          cp -a /work/assets/LICENSE.mkxp-z-with-https.txt ./LICENSE.txt
+          mkdir -p lib64
+
+          # El ejecutable buscará sus bibliotecas junto al runtime, no en el
+          # sistema de la consola.
+          patchelf --set-rpath '$ORIGIN/lib64' "$BIN"
+
+          # Copia de forma recursiva todas las bibliotecas dinámicas no
+          # pertenecientes a glibc. Esto incluye libruby y, si son necesarias,
+          # libstdc++, libgcc, libcrypt, libdrm, etc.
+          BIN_PATH="$(readlink -f "$BIN")" python3 - <<'PY'
+          import os
+          import re
+          import shutil
+          import subprocess
+          import sys
+          from pathlib import Path
+
+          binary = Path(os.environ['BIN_PATH'])
+          destination = binary.parent / 'lib64'
+          destination.mkdir(exist_ok=True)
+
+          search_dirs = [
+              Path('/work/linux/build-aarch64/lib'),
+              Path('/work/linux/build-aarch64/lib64'),
+              Path('/usr/lib/aarch64-linux-gnu'),
+              Path('/lib/aarch64-linux-gnu'),
+              Path('/usr/lib'),
+              Path('/lib'),
+          ]
+
+          # Estas bibliotecas forman parte de glibc o del cargador. La consola
+          # debe usar sus propias copias (glibc 2.30).
+          system_core = {
+              'ld-linux-aarch64.so.1', 'libc.so.6', 'libm.so.6',
+              'libpthread.so.0', 'libdl.so.2', 'librt.so.1',
+              'libutil.so.1', 'libresolv.so.2', 'libanl.so.1',
+              'linux-vdso.so.1'
+          }
+
+          needed_re = re.compile(r'\(NEEDED\).*\[(.+?)\]')
+
+          def needed(path):
+              output = subprocess.check_output(
+                  ['readelf', '-d', str(path)],
+                  stderr=subprocess.STDOUT,
+                  universal_newlines=True,
+              )
+              return [m.group(1) for m in map(needed_re.search, output.splitlines()) if m]
+
+          def resolve(name):
+              for directory in search_dirs:
+                  candidate = directory / name
+                  if candidate.exists():
+                      return candidate.resolve()
+              return None
+
+          queue = [binary]
+          scanned = set()
+          copied = {}
+          missing = set()
+
+          while queue:
+              current = queue.pop(0)
+              real_current = str(current.resolve())
+              if real_current in scanned:
+                  continue
+              scanned.add(real_current)
+
+              for name in needed(current):
+                  if name in system_core:
+                      continue
+                  source = resolve(name)
+                  if source is None:
+                      missing.add(name)
+                      continue
+                  target = destination / name
+                  if name not in copied:
+                      shutil.copy2(str(source), str(target))
+                      copied[name] = str(source)
+                      queue.append(target)
+
+          if missing:
+              print('Bibliotecas no resueltas:', ', '.join(sorted(missing)), file=sys.stderr)
+              sys.exit(1)
+
+          print('Bibliotecas incluidas:')
+          for name, source in sorted(copied.items()):
+              print('  {} <- {}'.format(name, source))
+          PY
+
+          # Cada biblioteca incluida busca sus dependencias en la misma carpeta.
+          for lib in lib64/*; do
+            if file "$lib" | grep -q 'ELF'; then
+              patchelf --set-rpath '$ORIGIN' "$lib" || true
+              strip --strip-unneeded "$lib" || true
+            fi
+          done
+          strip --strip-unneeded "$BIN" || true
+
+          export LD_LIBRARY_PATH="$PWD/lib64"
+
+          {
+            echo "===== K36S BUILD INFO ====="
+            echo "Commit: $(git -C /work rev-parse --short HEAD)"
+            echo "Fecha UTC: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+            echo "Compilador C: $(${CC} --version | head -n 1)"
+            echo "Compilador C++: $(${CXX} --version | head -n 1)"
+            echo "CMake: $(cmake --version | head -n 1)"
+            echo "Meson: $(meson --version)"
+            echo "Binario: $(file "$BIN")"
+            echo
+            echo "RPATH/RUNPATH:"
+            readelf -d "$BIN" | grep -E 'RPATH|RUNPATH' || true
+            echo
+            echo "Dependencias resueltas:"
+            ldd "$BIN"
+            echo
+            echo "Versiones GLIBC requeridas:"
+            for elf in "$BIN" lib64/*; do
+              if file "$elf" | grep -q 'ELF'; then
+                max_glibc="$(readelf --version-info "$elf" 2>/dev/null | grep -oE 'GLIBC_[0-9]+(\.[0-9]+)+' | sed 's/GLIBC_//' | sort -Vu | tail -n 1 || true)"
+                printf '%s: %s\n' "$elf" "${max_glibc:-ninguna}"
+                if [ -n "$max_glibc" ] && dpkg --compare-versions "$max_glibc" gt '2.30'; then
+                  echo "ERROR: $elf exige GLIBC_$max_glibc, superior a GLIBC_2.30." >&2
+                  exit 1
+                fi
+              fi
+            done
+            echo
+            sha256sum "$BIN" lib64/* 2>/dev/null || true
+          } | tee BUILD-INFO.txt
+
+          if ldd "$BIN" | grep -q 'not found'; then
+            echo "Quedan bibliotecas sin resolver." >&2
+            ldd "$BIN" >&2
+            exit 1
+          fi
+
+          if ! file "$BIN" | grep -q 'ARM aarch64'; then
+            echo "El ejecutable generado no es ARM64/aarch64." >&2
+            file "$BIN" >&2
+            exit 1
+          fi
+
+          chmod -R a+rX /work/build /work/build-logs
+          echo "Compilación y verificaciones completadas correctamente."
+          CONTAINER_SCRIPT
+
+          chmod +x "$RUNNER_TEMP/build-k36s-container.sh"
+
+      - name: Build and verify inside Ubuntu 18.04 ARM64
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          mkdir -p "$GITHUB_WORKSPACE/build-logs"
           docker run --rm \
             --platform linux/arm64 \
-            -v "$GITHUB_WORKSPACE:/work" \
-            -w /work \
+            --volume "$GITHUB_WORKSPACE:/work" \
+            --volume "$RUNNER_TEMP/build-k36s-container.sh:/build-k36s.sh:ro" \
+            --workdir /work \
             arm64v8/ubuntu:18.04 \
-            bash -lc '
-              set -eux
-              export DEBIAN_FRONTEND=noninteractive
+            bash /build-k36s.sh 2>&1 | tee "$GITHUB_WORKSPACE/build-logs/full-build.log"
 
-              apt-get update
-              apt-get install -y \
-                git wget ca-certificates \
-                build-essential gcc g++ \
-                cmake autoconf automake libtool pkg-config \
-                python3 python3-pip python3-setuptools \
-                ruby bison xxd \
-                zlib1g-dev libbz2-dev \
-                libasound2-dev libpulse-dev \
-                libgl1-mesa-dev libegl1-mesa-dev libgles2-mesa-dev \
-                libx11-dev libxext-dev libxrandr-dev libxcursor-dev \
-                libxi-dev libxinerama-dev libxss-dev libxxf86vm-dev
-
-              python3 -m pip install --upgrade "pip<22" setuptools wheel
-              python3 -m pip install "meson==0.61.5" "ninja==1.10.2.4"
-
-              # D-Bus 1.16 usa list(JOIN) en sus pruebas, pero el CMake de
-              # Ubuntu 18.04 es demasiado antiguo. Las pruebas no son necesarias
-              # para construir la biblioteca que necesita SDL2.
-              sed -i 's/-DDBUS_WITH_GLIB=no -DDBUS_SESSION_SOCKET_DIR=\/tmp/-DDBUS_WITH_GLIB=no -DDBUS_BUILD_TESTS=no -DDBUS_SESSION_SOCKET_DIR=\/tmp/' /work/linux/Makefile
-
-              cd /work/linux
-              make NPROC=2
-
-              cd /work
-              . linux/vars.sh
-              meson setup build \
-                --bindir=. \
-                --prefix=/work/build/local \
-                -Dgfx_backend=gles
-
-              cd build
-              ninja -j2
-              ninja install
-
-              cd /work/build/local
-              cp -r /work/linux/build-aarch64/lib/ruby/3.1.0 ./stdlib
-              cp /work/mkxp.json .
-              cp -r /work/scripts .
-              cp /work/assets/LICENSE.mkxp-z-with-https.txt .
-
-              echo "Versiones requeridas por el binario:"
-              strings ./mkxp-z.aarch64 | grep -E "GLIBC_[0-9]|GLIBCXX_|CXXABI_" | sort -Vu | tail -n 30 || true
-            '
-
-      - name: Upload K36S artifact
+      - name: Upload K36S runtime
         uses: actions/upload-artifact@v4
         with:
-          name: mkxp-z.k36s.ubuntu18.04.arm64
+          name: mkxp-z.k36s.glibc227.arm64.v4
           path: build/local
           if-no-files-found: error
+          compression-level: 9
+
+      - name: Upload diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mkxp-z.k36s.build-diagnostics.v4
+          path: |
+            build-logs
+            build/meson-logs
+            linux/downloads/**/CMakeFiles/CMakeError.log
+            linux/downloads/**/CMakeFiles/CMakeOutput.log
+            linux/downloads/**/config.log
+          if-no-files-found: ignore
+          retention-days: 7
