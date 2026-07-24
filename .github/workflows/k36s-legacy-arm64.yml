@@ -47,6 +47,11 @@ jobs:
               python3 -m pip install --upgrade "pip<22" setuptools wheel
               python3 -m pip install "meson==0.61.5" "ninja==1.10.2.4"
 
+              # D-Bus 1.16 usa list(JOIN) en sus pruebas, pero el CMake de
+              # Ubuntu 18.04 es demasiado antiguo. Las pruebas no son necesarias
+              # para construir la biblioteca que necesita SDL2.
+              sed -i 's/-DDBUS_WITH_GLIB=no -DDBUS_SESSION_SOCKET_DIR=\/tmp/-DDBUS_WITH_GLIB=no -DDBUS_BUILD_TESTS=no -DDBUS_SESSION_SOCKET_DIR=\/tmp/' /work/linux/Makefile
+
               cd /work/linux
               make NPROC=2
 
