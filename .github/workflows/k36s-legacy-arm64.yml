@@ -1,4 +1,4 @@
-name: Build K36S Legacy ARM64 v5
+name: Build K36S Legacy ARM64 v6
 
 on:
   workflow_dispatch:
@@ -107,10 +107,10 @@ jobs:
 
           echo "===== TOOLCHAIN ====="
           uname -a
-          ldd --version | head -n 1
-          "${CC}" --version | head -n 1
-          "${CXX}" --version | head -n 1
-          cmake --version | head -n 1
+          ldd --version | sed -n '1p'
+          "${CC}" --version | sed -n '1p'
+          "${CXX}" --version | sed -n '1p'
+          cmake --version | sed -n '1p'
           meson --version
           ninja --version
           echo "====================="
@@ -147,6 +147,19 @@ jobs:
 
           makefile.write_text(text)
 
+          # Al desactivar JPEG XL en SDL_image, también hay que retirar sus
+          # objetivos CMake de la detección de Meson. De lo contrario, la
+          # compilación de SDL_image termina bien pero Meson intenta enlazar
+          # objetivos que deliberadamente no existen.
+          src_meson = Path('/work/src/meson.build')
+          src_text = src_meson.read_text()
+          old_modules = "modules: ['SDL2_image::SDL2_image-static', 'SDL2_image::brotlidec-static', 'SDL2_image::brotlicommon-static', 'SDL2_image::hwy', 'SDL2_image::jxl_dec-static']"
+          new_modules = "modules: ['SDL2_image::SDL2_image-static']"
+          occurrences = src_text.count(old_modules)
+          if occurrences != 2:
+              raise SystemExit('Se esperaban 2 listas de módulos JXL en src/meson.build y se encontraron {}'.format(occurrences))
+          src_meson.write_text(src_text.replace(old_modules, new_modules))
+
           install_script = Path('/work/linux/install.sh')
           install_script.write_text(r'''#!/usr/bin/env bash
           set -u
@@ -177,8 +190,12 @@ jobs:
 
           grep -F -- '-DSDL_DBUS=no' /work/linux/Makefile >/dev/null
           grep -F -- '-DSDL2IMAGE_JXL=no' /work/linux/Makefile >/dev/null
-          if grep -F -- 'libdbus-1.so.3.38.3' /work/linux/Makefile | grep -F 'sdl2/CMakeLists.txt' >/dev/null; then
+          if awk '/sdl2\/CMakeLists\.txt/ && /libdbus-1\.so\.3\.38\.3/ { found=1 } END { exit !found }' /work/linux/Makefile; then
             echo 'La dependencia obligatoria de D-Bus sigue presente en la regla de SDL2.' >&2
+            exit 1
+          fi
+          if grep -F -- 'SDL2_image::jxl_dec-static' /work/src/meson.build >/dev/null; then
+            echo 'Meson todavía solicita los objetivos de JPEG XL que se han desactivado.' >&2
             exit 1
           fi
 
@@ -314,8 +331,15 @@ jobs:
           PY
 
           # Cada biblioteca incluida busca sus dependencias en la misma carpeta.
-          for lib in lib64/*; do
-            if file "$lib" | grep -q 'ELF'; then
+          shopt -s nullglob
+          bundled_libs=(lib64/*)
+          if [ "${#bundled_libs[@]}" -eq 0 ]; then
+            echo "No se ha incluido ninguna biblioteca dinámica en lib64." >&2
+            exit 1
+          fi
+          for lib in "${bundled_libs[@]}"; do
+            lib_desc="$(file -b "$lib")"
+            if [[ "$lib_desc" == *ELF* ]]; then
               patchelf --set-rpath '$ORIGIN' "$lib" || true
               strip --strip-unneeded "$lib" || true
             fi
@@ -328,9 +352,9 @@ jobs:
             echo "===== K36S BUILD INFO ====="
             echo "Commit: $(git -C /work rev-parse --short HEAD)"
             echo "Fecha UTC: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
-            echo "Compilador C: $(${CC} --version | head -n 1)"
-            echo "Compilador C++: $(${CXX} --version | head -n 1)"
-            echo "CMake: $(cmake --version | head -n 1)"
+            echo "Compilador C: $(${CC} --version | sed -n '1p')"
+            echo "Compilador C++: $(${CXX} --version | sed -n '1p')"
+            echo "CMake: $(cmake --version | sed -n '1p')"
             echo "Meson: $(meson --version)"
             echo "Binario: $(file "$BIN")"
             echo
@@ -341,8 +365,9 @@ jobs:
             ldd "$BIN"
             echo
             echo "Versiones GLIBC requeridas:"
-            for elf in "$BIN" lib64/*; do
-              if file "$elf" | grep -q 'ELF'; then
+            for elf in "$BIN" "${bundled_libs[@]}"; do
+              elf_desc="$(file -b "$elf")"
+              if [[ "$elf_desc" == *ELF* ]]; then
                 max_glibc="$(readelf --version-info "$elf" 2>/dev/null | grep -oE 'GLIBC_[0-9]+(\.[0-9]+)+' | sed 's/GLIBC_//' | sort -Vu | tail -n 1 || true)"
                 printf '%s: %s\n' "$elf" "${max_glibc:-ninguna}"
                 if [ -n "$max_glibc" ] && dpkg --compare-versions "$max_glibc" gt '2.30'; then
@@ -355,15 +380,21 @@ jobs:
             sha256sum "$BIN" lib64/* 2>/dev/null || true
           } | tee BUILD-INFO.txt
 
-          if ldd "$BIN" | grep -q 'not found'; then
+          if ! LDD_OUTPUT="$(ldd "$BIN" 2>&1)"; then
+            echo "ldd no pudo analizar el ejecutable:" >&2
+            printf '%s\n' "$LDD_OUTPUT" >&2
+            exit 1
+          fi
+          if grep -q 'not found' <<< "$LDD_OUTPUT"; then
             echo "Quedan bibliotecas sin resolver." >&2
-            ldd "$BIN" >&2
+            printf '%s\n' "$LDD_OUTPUT" >&2
             exit 1
           fi
 
-          if ! file "$BIN" | grep -q 'ARM aarch64'; then
+          BIN_DESC="$(file -b "$BIN")"
+          if [[ "$BIN_DESC" != *"ARM aarch64"* ]]; then
             echo "El ejecutable generado no es ARM64/aarch64." >&2
-            file "$BIN" >&2
+            echo "$BIN_DESC" >&2
             exit 1
           fi
 
@@ -389,7 +420,7 @@ jobs:
       - name: Upload K36S runtime
         uses: actions/upload-artifact@v4
         with:
-          name: mkxp-z.k36s.glibc227.arm64.v5
+          name: mkxp-z.k36s.glibc227.arm64.v6
           path: build/local
           if-no-files-found: error
           compression-level: 9
@@ -398,7 +429,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: mkxp-z.k36s.build-diagnostics.v5
+          name: mkxp-z.k36s.build-diagnostics.v6
           path: |
             build-logs
             build/meson-logs
