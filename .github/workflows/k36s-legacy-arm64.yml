@@ -1,4 +1,4 @@
-name: Build K36S Legacy ARM64 v6
+name: Build K36S Legacy ARM64 v7
 
 on:
   workflow_dispatch:
@@ -34,7 +34,11 @@ jobs:
           trap 'rc=$?; echo; echo "[ERROR] Línea ${LINENO}: ${BASH_COMMAND}"; echo "[ERROR] Código de salida: ${rc}"; exit "${rc}"' ERR
 
           export DEBIAN_FRONTEND=noninteractive
-          export MAKEFLAGS="-j2"
+          # El Makefile oficial presupone que el nivel superior se ejecuta
+          # de forma secuencial. Solo paraleliza la compilación interna de cada
+          # biblioteca mediante NPROC. Forzar MAKEFLAGS=-j2 aquí provoca carreras:
+          # Vorbis puede configurarse antes de que Ogg haya sido instalado.
+          unset MAKEFLAGS MFLAGS || true
 
           mkdir -p /work/build-logs
 
@@ -206,7 +210,8 @@ jobs:
                  /work/linux/downloads/aarch64
 
           cd /work/linux
-          make NPROC=2
+          echo "Construyendo dependencias en orden secuencial; cada biblioteca usa hasta 2 hilos."
+          env -u MAKEFLAGS -u MFLAGS make NPROC=2
 
           cd /work
           # vars.sh está escrito para shells sin `set -u` y consulta variables
@@ -420,7 +425,7 @@ jobs:
       - name: Upload K36S runtime
         uses: actions/upload-artifact@v4
         with:
-          name: mkxp-z.k36s.glibc227.arm64.v6
+          name: mkxp-z.k36s.glibc227.arm64.v7
           path: build/local
           if-no-files-found: error
           compression-level: 9
@@ -429,7 +434,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: mkxp-z.k36s.build-diagnostics.v6
+          name: mkxp-z.k36s.build-diagnostics.v7
           path: |
             build-logs
             build/meson-logs
