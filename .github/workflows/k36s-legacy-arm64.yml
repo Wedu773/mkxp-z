@@ -1,4 +1,4 @@
-name: Build K36S Legacy ARM64 v9
+name: Build K36S Legacy ARM64 v10
 
 on:
   workflow_dispatch:
@@ -149,7 +149,31 @@ jobs:
                   '$(DOWNLOADS)/sdl2/CMakeLists.txt $(LIBDIR)/libdbus-1.so.3.38.3',
                   '$(DOWNLOADS)/sdl2/CMakeLists.txt'
               ),
-              ('-DSDL_DBUS=yes', '-DSDL_DBUS=no'),
+              (
+                  '-DSDL_DBUS=yes',
+                  '-DSDL_DBUS=no '
+                  '-DSDL_KMSDRM=ON -DSDL_KMSDRM_SHARED=ON '
+                  '-DSDL_LIBUDEV=ON '
+                  '-DSDL_X11=OFF -DSDL_WAYLAND=OFF '
+                  '-DSDL_PULSEAUDIO=OFF -DSDL_ALSA=ON'
+              ),
+              (
+                  'PKG_CONFIG_LIBDIR := $(BUILD_PREFIX)/lib/pkgconfig',
+                  'PKG_CONFIG_LIBDIR := $(BUILD_PREFIX)/lib/pkgconfig:/usr/lib/aarch64-linux-gnu/pkgconfig:/usr/share/pkgconfig'
+              ),
+              (
+                  'OPENAL_FLAGS := -DALSOFT_CPUEXT_NEON=no ${OPENAL_FLAGS}',
+                  'OPENAL_FLAGS := -DALSOFT_CPUEXT_NEON=no '
+                  '-DALSOFT_BACKEND_PULSEAUDIO=OFF '
+                  '-DALSOFT_BACKEND_PIPEWIRE=OFF '
+                  '-DALSOFT_BACKEND_ALSA=ON '
+                  '-DALSOFT_RTKIT=OFF ${OPENAL_FLAGS}'
+              ),
+              (
+                  '-Denable-systemd=no -Denable-dbus=no',
+                  '-Denable-systemd=no -Denable-dbus=no '
+                  '-Denable-pulseaudio=no -Denable-alsa=no'
+              ),
               # JPEG y PNG cubren los recursos de RPG Maker/Pokémon Essentials.
               # JXL arrastra Highway y exige toolchains más recientes sin aportar
               # nada a estos juegos, así que se desactiva en el build legado.
@@ -213,6 +237,12 @@ jobs:
           PY
 
           grep -F -- '-DSDL_DBUS=no' /work/linux/Makefile >/dev/null
+          grep -F -- '-DSDL_KMSDRM=ON' /work/linux/Makefile >/dev/null
+          grep -F -- '-DSDL_KMSDRM_SHARED=ON' /work/linux/Makefile >/dev/null
+          grep -F -- '-DSDL_X11=OFF' /work/linux/Makefile >/dev/null
+          grep -F -- '/usr/lib/aarch64-linux-gnu/pkgconfig' /work/linux/Makefile >/dev/null
+          grep -F -- '-DALSOFT_BACKEND_PULSEAUDIO=OFF' /work/linux/Makefile >/dev/null
+          grep -F -- '-Denable-pulseaudio=no' /work/linux/Makefile >/dev/null
           grep -F -- '-DSDL2IMAGE_JXL=no' /work/linux/Makefile >/dev/null
           grep -F -- 'openal-soft -b 1.23.1' /work/linux/Makefile >/dev/null
           if grep -F -- 'openal-soft -b 1.24.3' /work/linux/Makefile >/dev/null; then
@@ -238,9 +268,37 @@ jobs:
             rm -rf /work/build
           fi
 
+          # La v9 compiló SDL2 sin KMSDRM, por lo que solo se invalidan SDL2,
+          # OpenAL y FluidSynth. El resto de la caché pesada se conserva.
+          rm -rf /work/linux/downloads/aarch64/sdl2/cmakebuild
+          rm -f /work/linux/build-aarch64/lib/libSDL2.a
+          rm -f /work/linux/build-aarch64/lib/pkgconfig/sdl2.pc
+          rm -rf /work/linux/build-aarch64/lib/cmake/SDL2
+
+          rm -rf /work/linux/downloads/aarch64/openal/cmakebuild
+          rm -f /work/linux/build-aarch64/lib/libopenal.a
+          rm -f /work/linux/build-aarch64/lib/pkgconfig/openal.pc
+          rm -f /work/linux/build-aarch64/lib/pkgconfig/openal-soft.pc
+
+          rm -rf /work/linux/downloads/aarch64/fluidsynth/cmakebuild
+          rm -f /work/linux/build-aarch64/lib/libfluidsynth.a
+          rm -rf /work/linux/build-aarch64/lib/cmake/fluidsynth
+
           cd /work/linux
           echo "Construyendo dependencias en orden secuencial; cada biblioteca usa hasta 2 hilos."
           env -u MAKEFLAGS -u MFLAGS make NPROC=2
+
+          SDL_CACHE=/work/linux/downloads/aarch64/sdl2/cmakebuild/CMakeCache.txt
+          test -f "$SDL_CACHE"
+          grep -E '^SDL_KMSDRM:BOOL=ON$' "$SDL_CACHE"
+          grep -E '^SDL_KMSDRM_SHARED:BOOL=ON$' "$SDL_CACHE"
+          grep -E '^SDL_LIBUDEV:BOOL=ON$' "$SDL_CACHE"
+          grep -E '^SDL_X11:BOOL=OFF$' "$SDL_CACHE"
+
+          OPENAL_CACHE=/work/linux/downloads/aarch64/openal/cmakebuild/CMakeCache.txt
+          test -f "$OPENAL_CACHE"
+          grep -E '^ALSOFT_BACKEND_PULSEAUDIO:BOOL=OFF$' "$OPENAL_CACHE"
+          grep -E '^ALSOFT_BACKEND_ALSA:BOOL=ON$' "$OPENAL_CACHE"
 
           cd /work
           # vars.sh está escrito para shells sin `set -u` y consulta variables
@@ -425,6 +483,9 @@ jobs:
             echo "Compilador C++: $(${CXX} --version | sed -n '1p')"
             echo "CMake: $(cmake --version | sed -n '1p')"
             echo "Meson: $(meson --version)"
+            echo "SDL KMSDRM: ON (carga dinámica de DRM/GBM)"
+            echo "SDL X11: OFF"
+            echo "OpenAL: ALSA ON, PulseAudio OFF"
             echo "Binario: $(file "$BIN")"
             echo
             echo "RPATH/RUNPATH:"
@@ -499,7 +560,7 @@ jobs:
       - name: Upload K36S runtime
         uses: actions/upload-artifact@v4
         with:
-          name: mkxp-z.k36s.glibc227.arm64.v9
+          name: mkxp-z.k36s.glibc227.kmsdrm.arm64.v10
           path: build/local
           if-no-files-found: error
           compression-level: 9
@@ -508,7 +569,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: mkxp-z.k36s.build-diagnostics.v9
+          name: mkxp-z.k36s.build-diagnostics.v10
           path: |
             build-logs
             build/meson-logs
