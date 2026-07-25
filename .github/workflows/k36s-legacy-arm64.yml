@@ -1,4 +1,4 @@
-name: Build K36S Legacy ARM64 v8
+name: Build K36S Legacy ARM64 v9
 
 on:
   workflow_dispatch:
@@ -31,6 +31,7 @@ jobs:
           path: |
             linux/build-aarch64
             linux/downloads/aarch64
+            build
           key: k36s-bionic-arm64-openal1231-${{ hashFiles('linux/Makefile') }}-${{ github.run_id }}
           restore-keys: |
             k36s-bionic-arm64-openal1231-${{ hashFiles('linux/Makefile') }}-
@@ -227,16 +228,15 @@ jobs:
             exit 1
           fi
 
-          # Construcción limpia y reproducible. Evita reutilizar restos de una
-          # ejecución fallida anterior.
-          # Conservamos dependencias ya construidas para que una futura
-          # corrección no obligue a repetir otros 40 minutos. OpenAL sí se
-          # elimina expresamente para garantizar que se reconstruya como 1.23.1.
-          rm -rf /work/build
-          rm -rf /work/linux/downloads/aarch64/openal
-          rm -f /work/linux/build-aarch64/lib/libopenal.a
-          rm -f /work/linux/build-aarch64/lib/pkgconfig/openal.pc
-          rm -f /work/linux/build-aarch64/lib/pkgconfig/openal-soft.pc
+          # Conservamos las dependencias que ya compiló la v8. Esa ejecución
+          # llegó a enlazar mkxp-z correctamente; el fallo fue únicamente al
+          # localizar libpulsecommon durante el empaquetado.
+          #
+          # Si en futuras ejecuciones se restaura también el directorio Meson,
+          # solo se reutiliza cuando contiene un build válido.
+          if [ -d /work/build ] && [ ! -f /work/build/build.ninja ]; then
+            rm -rf /work/build
+          fi
 
           cd /work/linux
           echo "Construyendo dependencias en orden secuencial; cada biblioteca usa hasta 2 hilos."
@@ -250,14 +250,25 @@ jobs:
           source linux/vars.sh
           set -u
 
-          meson setup build \
-            --bindir=. \
-            --prefix=/work/build/local \
-            -Dgfx_backend=gles \
-            -Dworkdir_current=true \
-            -Dstatic_executable=true \
-            -Dappimage=false \
-            -Dcjk_fallback_font=false
+          if [ -f build/build.ninja ]; then
+            meson setup --reconfigure build \
+              --bindir=. \
+              --prefix=/work/build/local \
+              -Dgfx_backend=gles \
+              -Dworkdir_current=true \
+              -Dstatic_executable=true \
+              -Dappimage=false \
+              -Dcjk_fallback_font=false
+          else
+            meson setup build \
+              --bindir=. \
+              --prefix=/work/build/local \
+              -Dgfx_backend=gles \
+              -Dworkdir_current=true \
+              -Dstatic_executable=true \
+              -Dappimage=false \
+              -Dcjk_fallback_font=false
+          fi
 
           ninja -C build -j2
           ninja -C build install
@@ -298,10 +309,24 @@ jobs:
           search_dirs = [
               Path('/work/linux/build-aarch64/lib'),
               Path('/work/linux/build-aarch64/lib64'),
+              # En Ubuntu 18.04 libpulsecommon no está junto a libpulse.so,
+              # sino dentro de este subdirectorio privado.
+              Path('/usr/lib/aarch64-linux-gnu/pulseaudio'),
+              Path('/lib/aarch64-linux-gnu/pulseaudio'),
+              Path('/usr/lib/aarch64-linux-gnu/alsa-lib'),
               Path('/usr/lib/aarch64-linux-gnu'),
               Path('/lib/aarch64-linux-gnu'),
               Path('/usr/lib'),
               Path('/lib'),
+          ]
+
+          # Directorios donde se permite una búsqueda recursiva de respaldo.
+          # Sirve para otras bibliotecas privadas que una distribución coloque
+          # en subcarpetas, sin tener que crear una v10 por cada nombre.
+          recursive_roots = [
+              Path('/work/linux/build-aarch64'),
+              Path('/usr/lib/aarch64-linux-gnu'),
+              Path('/lib/aarch64-linux-gnu'),
           ]
 
           # Estas bibliotecas forman parte de glibc o del cargador. La consola
@@ -328,6 +353,16 @@ jobs:
                   candidate = directory / name
                   if candidate.exists():
                       return candidate.resolve()
+
+              # Respaldo para SONAMEs alojados en rutas privadas, por ejemplo:
+              # /usr/lib/aarch64-linux-gnu/pulseaudio/libpulsecommon-11.1.so
+              for root in recursive_roots:
+                  if not root.exists():
+                      continue
+                  for candidate in root.rglob(name):
+                      if candidate.exists():
+                          print('Resolución recursiva: {} -> {}'.format(name, candidate))
+                          return candidate.resolve()
               return None
 
           queue = [binary]
@@ -458,12 +493,13 @@ jobs:
           path: |
             linux/build-aarch64
             linux/downloads/aarch64
+            build
           key: ${{ steps.restore-k36s-deps.outputs.cache-primary-key }}
 
       - name: Upload K36S runtime
         uses: actions/upload-artifact@v4
         with:
-          name: mkxp-z.k36s.glibc227.arm64.v8
+          name: mkxp-z.k36s.glibc227.arm64.v9
           path: build/local
           if-no-files-found: error
           compression-level: 9
@@ -472,7 +508,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: mkxp-z.k36s.build-diagnostics.v8
+          name: mkxp-z.k36s.build-diagnostics.v9
           path: |
             build-logs
             build/meson-logs
