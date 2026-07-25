@@ -1,4 +1,4 @@
-name: Build K36S Legacy ARM64 v7
+name: Build K36S Legacy ARM64 v8
 
 on:
   workflow_dispatch:
@@ -23,6 +23,17 @@ jobs:
         uses: docker/setup-qemu-action@v3
         with:
           platforms: arm64
+
+      - name: Restore compiled dependency cache
+        id: restore-k36s-deps
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            linux/build-aarch64
+            linux/downloads/aarch64
+          key: k36s-bionic-arm64-openal1231-${{ hashFiles('linux/Makefile') }}-${{ github.run_id }}
+          restore-keys: |
+            k36s-bionic-arm64-openal1231-${{ hashFiles('linux/Makefile') }}-
 
       - name: Create the ARM64 container build script
         shell: bash
@@ -142,6 +153,14 @@ jobs:
               # JXL arrastra Highway y exige toolchains más recientes sin aportar
               # nada a estos juegos, así que se desactiva en el build legado.
               ('-DSDL2IMAGE_JXL=yes', '-DSDL2IMAGE_JXL=no'),
+              # OpenAL Soft 1.24.3 usa construcciones constexpr que no compilan
+              # correctamente con GCC 8. La rama 1.23.1 incluye arreglos
+              # específicos para compiladores GCC antiguos y sigue superando
+              # el mínimo >=1.20.1 requerido por mkxp-z.
+              (
+                  '$(CLONE) $(GITHUB)/kcat/openal-soft -b 1.24.3 $(DOWNLOADS)/openal',
+                  '$(CLONE) $(GITHUB)/kcat/openal-soft -b 1.23.1 $(DOWNLOADS)/openal'
+              ),
           ]
 
           for old, new in replacements:
@@ -194,6 +213,11 @@ jobs:
 
           grep -F -- '-DSDL_DBUS=no' /work/linux/Makefile >/dev/null
           grep -F -- '-DSDL2IMAGE_JXL=no' /work/linux/Makefile >/dev/null
+          grep -F -- 'openal-soft -b 1.23.1' /work/linux/Makefile >/dev/null
+          if grep -F -- 'openal-soft -b 1.24.3' /work/linux/Makefile >/dev/null; then
+            echo 'OpenAL Soft 1.24.3 sigue presente; no se aplicó el pin legado.' >&2
+            exit 1
+          fi
           if awk '/sdl2\/CMakeLists\.txt/ && /libdbus-1\.so\.3\.38\.3/ { found=1 } END { exit !found }' /work/linux/Makefile; then
             echo 'La dependencia obligatoria de D-Bus sigue presente en la regla de SDL2.' >&2
             exit 1
@@ -205,9 +229,14 @@ jobs:
 
           # Construcción limpia y reproducible. Evita reutilizar restos de una
           # ejecución fallida anterior.
-          rm -rf /work/build \
-                 /work/linux/build-aarch64 \
-                 /work/linux/downloads/aarch64
+          # Conservamos dependencias ya construidas para que una futura
+          # corrección no obligue a repetir otros 40 minutos. OpenAL sí se
+          # elimina expresamente para garantizar que se reconstruya como 1.23.1.
+          rm -rf /work/build
+          rm -rf /work/linux/downloads/aarch64/openal
+          rm -f /work/linux/build-aarch64/lib/libopenal.a
+          rm -f /work/linux/build-aarch64/lib/pkgconfig/openal.pc
+          rm -f /work/linux/build-aarch64/lib/pkgconfig/openal-soft.pc
 
           cd /work/linux
           echo "Construyendo dependencias en orden secuencial; cada biblioteca usa hasta 2 hilos."
@@ -422,10 +451,19 @@ jobs:
             arm64v8/ubuntu:18.04 \
             bash /build-k36s.sh 2>&1 | tee "$GITHUB_WORKSPACE/build-logs/full-build.log"
 
+      - name: Save partial or complete dependency cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            linux/build-aarch64
+            linux/downloads/aarch64
+          key: ${{ steps.restore-k36s-deps.outputs.cache-primary-key }}
+
       - name: Upload K36S runtime
         uses: actions/upload-artifact@v4
         with:
-          name: mkxp-z.k36s.glibc227.arm64.v7
+          name: mkxp-z.k36s.glibc227.arm64.v8
           path: build/local
           if-no-files-found: error
           compression-level: 9
@@ -434,7 +472,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: mkxp-z.k36s.build-diagnostics.v7
+          name: mkxp-z.k36s.build-diagnostics.v8
           path: |
             build-logs
             build/meson-logs
